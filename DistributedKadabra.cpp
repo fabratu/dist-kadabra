@@ -16,7 +16,6 @@
 #include <networkit/auxiliary/Parallel.hpp>
 #include <networkit/auxiliary/Parallelism.hpp>
 #include <networkit/auxiliary/Random.hpp>
-#include <networkit/auxiliary/Timer.hpp>
 #include <networkit/distance/Diameter.hpp>
 
 #include "DistributedKadabra.hpp"
@@ -191,12 +190,12 @@ void DistributedKadabra::computeBetErr(DistributedStatus *status, std::vector<do
 }
 
 void DistributedKadabra::computeDeltaGuess() {
-    fabry::communicator world{fabry::world};
     const count n = G.upperNodeIdBound();
     const double balancingFactor = 0.001;
     double a = 0,
            b = 1. / err / err * std::log(n * 4 * (1 - balancingFactor) / delta),
            c = (a + b) / 2;
+    double sum;
 
     DistributedStatus status(unionSample);
     getStatus(&status, true);
@@ -204,46 +203,35 @@ void DistributedKadabra::computeDeltaGuess() {
     std::vector<double> bet(status.k);
     std::vector<double> errL(status.k);
     std::vector<double> errU(status.k);
-    std::vector<double> errLTerm(status.k);
-    std::vector<double> errUTerm(status.k);
 
     computeBetErr(&status, bet, errL, errU);
 
-#pragma omp parallel for
     for (count i = 0; i < unionSample; ++i) {
         count v = status.top[i];
         approxSum[v] = approxSum[v] / (double)nPairs;
-        errLTerm[i] = errL[i] * errL[i] / bet[i];
-        errUTerm[i] = errU[i] * errU[i] / bet[i];
     }
 
-    const count estChunk = (unionSample + world.n_ranks() - 1) / world.n_ranks();
-    const count estDisp = world.rank() * estChunk;
-    const count estLimit = std::min(unionSample, estDisp + estChunk);
-
-    int binSearchIters = 0;
     while (b - a > err / 10.) {
         c = (b + a) / 2.;
-        double localSum = 0;
+        sum = 0;
 #pragma omp parallel for
-        for (omp_index i = estDisp; i < static_cast<omp_index>(estLimit); ++i) {
-            localSum += std::exp(-c * errLTerm[i]);
-            localSum += std::exp(-c * errUTerm[i]);
+        for (omp_index i = 0; i < static_cast<omp_index>(unionSample); ++i) {
+            sum += std::exp(-c * errL[i] * errL[i] / bet[i]);
+            sum += std::exp(-c * errU[i] * errU[i] / bet[i]);
         }
 
-        double globalSum;
-        fabry::post(world.all_reduce(&localSum, 1, &globalSum));
+        sum += std::exp(-c * errL[unionSample - 1] * errL[unionSample - 1] /
+                        bet[unionSample - 1]) *
+               (n - unionSample);
+        sum += std::exp(-c * errU[unionSample - 1] * errU[unionSample - 1] /
+                        bet[unionSample - 1]) *
+               (n - unionSample);
 
-        globalSum += std::exp(-c * errLTerm[unionSample - 1]) * (n - unionSample);
-        globalSum += std::exp(-c * errUTerm[unionSample - 1]) * (n - unionSample);
-
-        if (globalSum >= delta / 2. * (1 - balancingFactor))
+        if (sum >= delta / 2. * (1 - balancingFactor))
             a = c;
         else
             b = c;
-        binSearchIters++;
     }
-    INFO("iterations in binary search: ", binSearchIters);
 
     deltaLMinGuess = std::exp(-b * errL[unionSample - 1] *
                               errL[unionSample - 1] / bet[unionSample - 1]) +
@@ -280,9 +268,11 @@ void DistributedKadabra::init() {
     approxSum.resize(n, 0);
     deltaLGuess.resize(n, 0);
     deltaUGuess.resize(n, 0);
-    cc = std::unique_ptr<ConnectedComponents>(new ConnectedComponents(G));
-    if (determineComponents && !G.isDirected())
-        cc->run();
+    if (!G.isDirected()) {
+        this->cc =
+            std::unique_ptr<ConnectedComponents>(new ConnectedComponents(G));
+        this->cc->run();
+    }
     epochFinished = std::vector<std::atomic<DistributedStateFrame *>>(omp_max_threads);
     samplerVec.reserve(omp_max_threads);
     for (count i = 0; i < omp_max_threads; ++i) {
@@ -329,14 +319,10 @@ void DistributedKadabra::fillResult() {
 void DistributedKadabra::run() {
     init();
     fabry::communicator world{fabry::world};
+
     const count n = G.upperNodeIdBound();
     const auto omp_max_threads = omp_get_max_threads();
     const omp_index globalCount = omp_max_threads * world.n_ranks();
-
-    Aux::Timer diamTimer;
-    Aux::Timer phase1Timer;
-    Aux::Timer phase1EstimateTimer;
-    Aux::Timer phase2Timer;
 
     // Compute the number of samples per SF as in our EUROPAR'19 paper.
     const auto itersPerStep = std::max(1U,
@@ -346,15 +332,12 @@ void DistributedKadabra::run() {
     // TODO: setting the maximum relateve error to 0 gives the exact diameter
     // but may be inefficient for large graphs. What is the maximum relative
     // error that we can tolerate?
-    diamTimer.start();
-    Diameter diam(G, estimatedRange, .5);
+    Diameter diam(G, estimatedRange, 0.f);
     diam.run();
     // Getting diameter upper bound
     int32_t diameter = diam.getDiameter().second;
-    INFO("diameter estimate is [", diam.getDiameter().first, ", ", diameter, ")");
     omega =
         0.5 / err / err * (std::log2(diameter - 1) + 1 + std::log(0.5 / delta));
-    diamTime += diamTimer.elapsedMilliseconds();
 
     const count tau = omega / startFactor;
 
@@ -378,43 +361,21 @@ void DistributedKadabra::run() {
 
     std::vector<DistributedStateFrame> firstFrames(omp_max_threads, DistributedStateFrame(n));
 
-    phase1Timer.start();
-    const int tau_disp = world.rank();
-    const int tau_step = world.n_ranks();
 #pragma omp parallel for schedule(dynamic)
-    for (omp_index i = tau_disp; i < static_cast<omp_index>(tau); i += tau_step) {
+    for (omp_index i = 0; i < static_cast<omp_index>(tau); ++i) {
         auto t = omp_get_thread_num();
         samplerVec[t].rng.seed(seed0 ^ i);
         samplerVec[t].randomPath(&firstFrames[t]);
     }
 
-    std::vector<count> localBuffer;
-    localBuffer.resize(G.upperNodeIdBound() + 1);
-
-    std::vector<count> stagingBuffer;
-    stagingBuffer.resize(G.upperNodeIdBound() + 1);
-
-#pragma omp parallel for
-    for (omp_index i = 0; i < static_cast<omp_index>(G.upperNodeIdBound()); ++i) {
-        for (int j = 0; j < omp_max_threads; ++j)
-            localBuffer[i] += firstFrames[j].apx[i];
-    }
-
-    fabry::post(world.all_reduce(localBuffer.data(), G.upperNodeIdBound(), stagingBuffer.data()));
-
-    for (count i = 0; i < G.upperNodeIdBound(); ++i)
-        approxSum[i] += stagingBuffer[i];
-
     nPairs = tau;
+
+    epochToRead.store(0, std::memory_order_relaxed);
+    computeApproxParallel(firstFrames);
     if (!absolute) {
         fillPQ();
     }
-    phase1EstimateTimer.start();
     computeDeltaGuess();
-    phase1EstimateTime += phase1EstimateTimer.elapsedMilliseconds();
-    phase1Time += phase1Timer.elapsedMilliseconds();
-
-    epochToRead.store(0, std::memory_order_relaxed);
     nPairs = 0;
     std::fill(approxSum.begin(), approxSum.end(), 0.0);
     epochToRead.store(-1, std::memory_order_relaxed);
@@ -424,8 +385,12 @@ void DistributedKadabra::run() {
     if (!absolute)
         top->clear();
 
+    fabry::passive_rdma_array<count> window{fabry::collective, world, G.upperNodeIdBound() + 1};
+
+    std::vector<count> stagingBuffer;
+    stagingBuffer.resize(G.upperNodeIdBound() + 1);
+
     DistributedStatus status(unionSample);
-    phase2Timer.start();
 #pragma omp parallel
     {
         const omp_index t = omp_get_thread_num();
@@ -502,74 +467,49 @@ void DistributedKadabra::run() {
                 doSample();
 
             if (!t) {
-                Aux::Timer phase2SyncTimer;
-                Aux::Timer phase2TransitionTimer;
-                Aux::Timer phase2BarrierTimer;
-                Aux::Timer phase2ReduceTimer;
-                Aux::Timer phase2CheckTimer;
-                Aux::Timer phase2BcastTimer;
-
-                phase2SyncTimer.start();
                 // Thread zero also has to check the stopping condition.
                 assert(epochToRead.load(std::memory_order_relaxed) == epochRead);
+
+                //INFO(world.rank(), " enters the barrier");
+                fabry::pollable epochBarrier{world.barrier(fabry::collective)};
+                while(!epochBarrier.done())
+                    doSample();
 
                 auto etr = epochRead + 1;
                 epochToRead.store(etr, std::memory_order_relaxed);
 
                 // Perform local aggregation.
-                phase2TransitionTimer.start();
                 std::fill(aggregationDone.begin(), aggregationDone.end(), false);
                 {
-                    memset(localBuffer.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+                    fabry::passive_rdma_array_scope<count> as{window};
+                    memset(as.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
 
                     while(true) {
-                        if(aggregateLocally(localBuffer.data()))
+                        if(aggregateLocally(as.data()))
                             break;
                         doSample();
                     }
                 }
-                phase2TransitionTime += phase2TransitionTimer.elapsedMilliseconds();
 
-                phase2BarrierTimer.start();
-                fabry::pollable aggBarrier{world.barrier(fabry::collective)};
-                while(true) {
-                    Aux::StartedTimer ioTimer;
-                    bool done = aggBarrier.done();
-                    phase2BarrierIoTime += ioTimer.elapsedMilliseconds();
-                    if(done)
-                        break;
-                    Aux::StartedTimer overlapTimer;
+                fabry::pollable aggregationBarrier{world.barrier(fabry::collective)};
+                while(!aggregationBarrier.done())
                     doSample();
-                    phase2BarrierOverlapTime += overlapTimer.elapsedMilliseconds();
-                }
-                phase2BarrierTime += phase2BarrierTimer.elapsedMilliseconds();
 
                 // Perform RDMA aggregation.
-                phase2ReduceTimer.start();
                 if(world.is_rank_zero()) {
-                    Aux::StartedTimer ioTimer;
-                    fabry::post(world.reduce(fabry::this_root,
-                            localBuffer.data(), localBuffer.size(), stagingBuffer.data()));
-                    phase2ReduceIoTime += ioTimer.elapsedMilliseconds();
+                    for(int rk = 0; rk < world.n_ranks(); rk++) {
+                        window.get_sync(rk, stagingBuffer.data());
 
-                    for (count i = 0; i < G.upperNodeIdBound(); ++i)
-                        approxSum[i] += stagingBuffer[i + 1];
-                    nPairs += stagingBuffer[0];
-                }else{
-                    Aux::StartedTimer ioTimer;
-                    fabry::post(world.reduce(fabry::zero_root,
-                            localBuffer.data(), localBuffer.size()));
-                    phase2ReduceIoTime += ioTimer.elapsedMilliseconds();
+                        for (count i = 0; i < G.upperNodeIdBound(); ++i)
+                            approxSum[i] += stagingBuffer[i + 1];
+                        nPairs += stagingBuffer[0];
+                    }
                 }
-                phase2ReduceTime += phase2ReduceTimer.elapsedMilliseconds();
 
                 // Check the stopping condition on rank zero.
-                phase2BcastTimer.start();
                 int globalStop;
                 if(world.is_rank_zero()) {
-                    phase2CheckTimer.start();
                     globalStop = checkConvergence(status);
-                    phase2CheckTime += phase2CheckTimer.elapsedMilliseconds();
                     fabry::pollable convergenceBcast{world.bcast(fabry::this_root, &globalStop)};
                     while(!convergenceBcast.done())
                         doSample();
@@ -578,12 +518,10 @@ void DistributedKadabra::run() {
                     while(!convergenceBcast.done())
                         doSample();
                 }
-                phase2BcastTime += phase2BcastTimer.elapsedMilliseconds();
                 if(globalStop)
                     stop.store(true, std::memory_order_relaxed);
 
                 epochRead++;
-                phase2SyncTime += phase2SyncTimer.elapsedMilliseconds();
             }
         }
 
@@ -591,7 +529,8 @@ void DistributedKadabra::run() {
         // allocated frames
 #pragma omp barrier
     }
-    phase2Time += phase2Timer.elapsedMilliseconds();
+
+    window.dispose(fabry::collective);
 
 #pragma omp parallel for
     for (omp_index i = 0; i < static_cast<omp_index>(n); ++i) {
@@ -665,8 +604,7 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
     while (u == v)
         v = distr(rng);
 
-    if (DistributedKadabra::determineComponents
-            && !G.isDirected() && cc.componentOfNode(u) != cc.componentOfNode(v))
+    if (!G.isDirected() && cc.componentOfNode(u) != cc.componentOfNode(v))
         return;
 
     count endQ = 2;
