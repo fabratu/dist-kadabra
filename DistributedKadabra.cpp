@@ -209,17 +209,17 @@ void DistributedKadabra::computeDeltaGuess() {
 
     computeBetErr(&status, bet, errL, errU);
 
-    const count estChunk = (unionSample + world.n_ranks() - 1) / world.n_ranks();
-    const count estDisp = world.rank() * estChunk;
-    const count estLimit = std::min(unionSample, estDisp + estChunk);
-
 #pragma omp parallel for
-    for (count i = estDisp; i < estLimit; ++i) {
+    for (count i = 0; i < unionSample; ++i) {
         count v = status.top[i];
         approxSum[v] = approxSum[v] / (double)nPairs;
         errLTerm[i] = errL[i] * errL[i] / bet[i];
         errUTerm[i] = errU[i] * errU[i] / bet[i];
     }
+
+    const count estChunk = (unionSample + world.n_ranks() - 1) / world.n_ranks();
+    const count estDisp = world.rank() * estChunk;
+    const count estLimit = std::min(unionSample, estDisp + estChunk);
 
     int binSearchIters = 0;
     while (b - a > err / 10.) {
