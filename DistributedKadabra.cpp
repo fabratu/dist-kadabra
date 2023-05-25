@@ -324,12 +324,15 @@ void DistributedKadabra::run() {
 
     Aux::Timer diamTimer;
     Aux::Timer phase1Timer;
+    Aux::Timer calibrateTimer;
     Aux::Timer phase2Timer;
 
     // Compute the number of samples per SF as in our EUROPAR'19 paper.
     const auto itersPerStep = std::max(1U,
             static_cast<unsigned int>(baseItersPerStep
                                       / std::pow(globalCount, itersPerStepExp)));
+
+    aggregationDone.resize(omp_max_threads);
 
     // TODO: setting the maximum relateve error to 0 gives the exact diameter
     // but may be inefficient for large graphs. What is the maximum relative
@@ -365,56 +368,171 @@ void DistributedKadabra::run() {
 
     std::vector<DistributedStateFrame> firstFrames(omp_max_threads, DistributedStateFrame(n));
 
-    phase1Timer.start();
-    const int tau_disp = world.rank();
-    const int tau_step = world.n_ranks();
-#pragma omp parallel for schedule(dynamic)
-    for (omp_index i = tau_disp; i < static_cast<omp_index>(tau); i += tau_step) {
-        auto t = omp_get_thread_num();
-        samplerVec[t].rng.seed(seed0 ^ i);
-        samplerVec[t].randomPath(&firstFrames[t]);
-    }
-
     std::vector<count> localBuffer;
     localBuffer.resize(G.upperNodeIdBound() + 1);
 
     std::vector<count> stagingBuffer;
     stagingBuffer.resize(G.upperNodeIdBound() + 1);
 
-#pragma omp parallel for
-    for (omp_index i = 0; i < static_cast<omp_index>(G.upperNodeIdBound()); ++i) {
-        for (int j = 0; j < omp_max_threads; ++j)
-            localBuffer[i] += firstFrames[j].apx[i];
+    phase1Timer.start();
+    stop.store(false, std::memory_order_relaxed);
+    epochRead = -1;
+    epochToRead.store(-1, std::memory_order_relaxed);
+    std::fill(epochFinished.begin(), epochFinished.end(), nullptr);
+#pragma omp parallel
+    {
+        const omp_index t = omp_get_thread_num();
+        const omp_index globalT = omp_max_threads * world.rank() + t;
+        DistributedSpSampler &sampler = samplerVec[t];
+        std::deque<DistributedStateFrame *> unused;
+        int32_t epochToWrite = 0;
+        DistributedStateFrame *curFrame = &firstFrames[t];
+        std::deque<DistributedStateFrame *> finishedQueue;
+        // Makes sure that dynamically allocated frames will be deallocated
+        std::vector<std::unique_ptr<DistributedStateFrame>> additionalFrames;
+        maxFrames[t] = 0;
+
+        auto moveToNextEpoch = [&]() {
+            ++epochToWrite;
+            if (unused.empty()) {
+                additionalFrames.push_back(
+                    std::unique_ptr<DistributedStateFrame>(new DistributedStateFrame(n)));
+                curFrame = additionalFrames.back().get();
+                ++maxFrames[t];
+            } else {
+                curFrame = unused.front();
+                unused.pop_front();
+            }
+            curFrame->reset(epochToWrite);
+            sampler.rng.seed(seed0 ^ (epochToWrite * globalCount + globalT));
+        };
+
+        auto recycleFrame = [&]() {
+            auto finishedFrame =
+                epochFinished[t].load(std::memory_order_relaxed);
+            if (finishedFrame) {
+                unused.push_back(finishedFrame);
+            }
+        };
+
+        auto doSample = [&]() {
+            sampler.randomPath(curFrame);
+            curFrame->nPairs++;
+
+            if (deterministic) {
+                assert(curFrame->nPairs <= 1000);
+                if (curFrame->nPairs == 1000) {
+                    finishedQueue.push_back(curFrame);
+                    moveToNextEpoch();
+                }
+
+                auto etr = epochToRead.load(std::memory_order_relaxed);
+                if (!finishedQueue.empty()) {
+                    auto frame = finishedQueue.front();
+                    auto epochToPublish = static_cast<int32_t>(frame->epoch);
+                    assert(etr <= epochToPublish);
+                    if (etr == epochToPublish) {
+                        recycleFrame();
+                        epochFinished[t].store(frame, std::memory_order_release);
+                        finishedQueue.pop_front();
+                    }
+                }
+            } else {
+                auto etr = epochToRead.load(std::memory_order_relaxed);
+                if (etr == epochToWrite) {
+                    recycleFrame();
+                    epochFinished[t].store(curFrame, std::memory_order_release);
+                    moveToNextEpoch();
+                }
+            }
+        };
+
+        curFrame->reset(epochToWrite);
+        sampler.rng.seed(seed0 ^ (epochToWrite * globalCount + globalT));
+
+        while (!stop.load(std::memory_order_relaxed)) {
+            for (unsigned int i = 0; i < itersPerStep; ++i)
+                doSample();
+
+            if (!t) {
+                // Thread zero also has to check the stopping condition.
+                assert(epochToRead.load(std::memory_order_relaxed) == epochRead);
+
+                auto etr = epochRead + 1;
+                epochToRead.store(etr, std::memory_order_relaxed);
+
+                // Perform local aggregation.
+                std::fill(aggregationDone.begin(), aggregationDone.end(), false);
+                {
+                    memset(localBuffer.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+
+                    while(true) {
+                        if(aggregateLocally(localBuffer.data()))
+                            break;
+                        doSample();
+                    }
+                }
+
+                fabry::pollable aggBarrier{world.barrier(fabry::collective)};
+                while(true) {
+                    bool done = aggBarrier.done();
+                    if(done)
+                        break;
+                    doSample();
+                }
+
+                // Perform RDMA aggregation.
+                if(world.is_rank_zero()) {
+                    fabry::post(world.reduce(fabry::this_root,
+                            localBuffer.data(), localBuffer.size(), stagingBuffer.data()));
+
+                    for (count i = 0; i < G.upperNodeIdBound(); ++i)
+                        approxSum[i] += stagingBuffer[i + 1];
+                    nPairs += stagingBuffer[0];
+                }else{
+                    fabry::post(world.reduce(fabry::zero_root,
+                            localBuffer.data(), localBuffer.size()));
+                }
+
+                // Check the stopping condition on rank zero.
+                int globalStop;
+                if(world.is_rank_zero()) {
+                    globalStop = nPairs >= tau;
+                    fabry::pollable convergenceBcast{world.bcast(fabry::this_root, &globalStop)};
+                    while(!convergenceBcast.done())
+                        doSample();
+                }else{
+                    fabry::pollable convergenceBcast{world.bcast(fabry::zero_root, &globalStop)};
+                    while(!convergenceBcast.done())
+                        doSample();
+                }
+                if(globalStop)
+                    stop.store(true, std::memory_order_relaxed);
+
+                epochRead++;
+            }
+        }
+
+        // Guarantees that all threads finish the loop here and destroy
+        // allocated frames
+#pragma omp barrier
     }
+    phase1Time += phase1Timer.elapsedMilliseconds();
 
-    if (world.is_rank_zero()) {
-        fabry::pollable aggReduction{world.reduce(fabry::this_root,
-                localBuffer.data(), G.upperNodeIdBound(), stagingBuffer.data())};
-        while(!aggReduction.done())
-            ;
-
-        for (count i = 0; i < G.upperNodeIdBound(); ++i)
-            approxSum[i] += stagingBuffer[i];
-    }else{
-        fabry::pollable aggReduction{world.reduce(fabry::zero_root,
-                localBuffer.data(), G.upperNodeIdBound())};
-        while(!aggReduction.done())
-            ;
-    }
-
-    nPairs = tau;
     if (!absolute) {
         fillPQ();
     }
+    calibrateTimer.start();
     computeDeltaGuess();
-    phase1Time += phase1Timer.elapsedMilliseconds();
+    calibrateTime += calibrateTimer.elapsedMilliseconds();
 
-    epochToRead.store(0, std::memory_order_relaxed);
+    stop.store(false, std::memory_order_relaxed);
+    epochRead = -1;
+    epochToRead.store(-1, std::memory_order_relaxed);
+    std::fill(epochFinished.begin(), epochFinished.end(), nullptr);
+
     nPairs = 0;
     std::fill(approxSum.begin(), approxSum.end(), 0.0);
-    epochToRead.store(-1, std::memory_order_relaxed);
-    epochRead = -1;
-    aggregationDone.resize(omp_max_threads);
 
     if (!absolute)
         top->clear();
