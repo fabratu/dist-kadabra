@@ -52,7 +52,6 @@ int main(int argc, char **argv) {
         std::cout << "time: " << secElapsed.count() << std::endl;
         std::cout << "mtime_diam: " << algo.diamTime << std::endl;
         std::cout << "mtime_phase1: " << algo.phase1Time << std::endl;
-        std::cout << "mtime_estimate: " << algo.phase1EstimateTime << std::endl;
         std::cout << "mtime_phase2: " << algo.phase2Time << std::endl;
         std::cout << "mtime_sync: " << algo.phase2SyncTime << std::endl;
         std::cout << "mtime_transition: " << algo.phase2TransitionTime << std::endl;
