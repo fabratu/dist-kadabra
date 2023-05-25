@@ -383,7 +383,8 @@ void DistributedKadabra::run() {
         top->clear();
 
     fabry::communicator world{fabry::world};
-    fabry::passive_rdma_array<count> window{fabry::collective, world, G.upperNodeIdBound() + 1};
+    std::vector<count> window;
+    window.resize(G.upperNodeIdBound() + 1);
 
     std::vector<count> stagingBuffer;
     stagingBuffer.resize(G.upperNodeIdBound() + 1);
@@ -480,11 +481,10 @@ void DistributedKadabra::run() {
                 // Perform local aggregation.
                 std::fill(aggregationDone.begin(), aggregationDone.end(), false);
                 {
-                    fabry::passive_rdma_array_scope<count> as{window};
-                    memset(as.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+                    memset(window.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
 
                     while(true) {
-                        if(aggregateLocally(as.data()))
+                        if(aggregateLocally(window.data()))
                             break;
                         doSample();
                     }
@@ -495,26 +495,19 @@ void DistributedKadabra::run() {
                     doSample();
 
                 // Perform RDMA aggregation.
-                for(int r = 0; (1 << r) < world.n_ranks(); r++) {
-                    int peer = world.rank() + (1 << r);
-                    if(!(world.rank() & ((1 << (r + 1)) - 1)) && peer < world.n_ranks()) {
-                        window.get_sync(peer, stagingBuffer.data());
+                if(world.is_rank_zero()) {
+                    fabry::pollable aggReduction{world.reduce(fabry::this_root,
+                            window.data(), window.size(), stagingBuffer.data())};
+                    while(!aggReduction.done())
+                        doSample();
 
-                        if(world.is_rank_zero()) {
-                            // Rank zero aggregates to its overall state.
-                            for (count i = 0; i < G.upperNodeIdBound(); ++i)
-                                approxSum[i] += stagingBuffer[i + 1];
-                            nPairs += stagingBuffer[0];
-                        }else{
-                            // All other ranks aggregate internally.
-                            fabry::passive_rdma_array_scope<count> as{window};
-                            for (count i = 0; i < G.upperNodeIdBound() + 1; ++i)
-                                as.data()[i] += stagingBuffer[i];
-                        }
-                    }
-
-                    fabry::pollable roundBarrier{world.barrier(fabry::collective)};
-                    while(!roundBarrier.done())
+                    for (count i = 0; i < G.upperNodeIdBound(); ++i)
+                        approxSum[i] += stagingBuffer[i + 1];
+                    nPairs += stagingBuffer[0];
+                }else{
+                    fabry::pollable aggReduction{world.reduce(fabry::zero_root,
+                            window.data(), window.size())};
+                    while(!aggReduction.done())
                         doSample();
                 }
 
@@ -541,8 +534,6 @@ void DistributedKadabra::run() {
         // allocated frames
 #pragma omp barrier
     }
-
-    window.dispose(fabry::collective);
 
 #pragma omp parallel for
     for (omp_index i = 0; i < static_cast<omp_index>(n); ++i) {
