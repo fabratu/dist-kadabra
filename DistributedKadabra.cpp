@@ -495,14 +495,27 @@ void DistributedKadabra::run() {
                     doSample();
 
                 // Perform RDMA aggregation.
-                if(world.is_rank_zero()) {
-                    for(int rk = 0; rk < world.n_ranks(); rk++) {
-                        window.get_sync(rk, stagingBuffer.data());
+                for(int r = 0; (1 << r) < world.n_ranks(); r++) {
+                    int peer = world.rank() + (1 << r);
+                    if(!(world.rank() & ((1 << (r + 1)) - 1)) && peer < world.n_ranks()) {
+                        window.get_sync(peer, stagingBuffer.data());
 
-                        for (count i = 0; i < G.upperNodeIdBound(); ++i)
-                            approxSum[i] += stagingBuffer[i + 1];
-                        nPairs += stagingBuffer[0];
+                        if(world.is_rank_zero()) {
+                            // Rank zero aggregates to its overall state.
+                            for (count i = 0; i < G.upperNodeIdBound(); ++i)
+                                approxSum[i] += stagingBuffer[i + 1];
+                            nPairs += stagingBuffer[0];
+                        }else{
+                            // All other ranks aggregate internally.
+                            fabry::passive_rdma_array_scope<count> as{window};
+                            for (count i = 0; i < G.upperNodeIdBound() + 1; ++i)
+                                as.data()[i] += stagingBuffer[i];
+                        }
                     }
+
+                    fabry::pollable roundBarrier{world.barrier(fabry::collective)};
+                    while(!roundBarrier.done())
+                        doSample();
                 }
 
                 // Check the stopping condition on rank zero.
