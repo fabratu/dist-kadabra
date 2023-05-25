@@ -272,12 +272,11 @@ void DistributedKadabra::init() {
     cc = std::unique_ptr<ConnectedComponents>(new ConnectedComponents(G));
     if (determineComponents && !G.isDirected())
         cc->run();
-    epochFinished = std::vector<std::atomic<DistributedStateFrame *>>(2 * omp_max_threads);
+    epochFinished = std::vector<std::atomic<DistributedStateFrame *>>(omp_max_threads);
     samplerVec.reserve(omp_max_threads);
     for (count i = 0; i < omp_max_threads; ++i) {
         samplerVec.emplace_back(DistributedSpSampler(G, *cc));
-        epochFinished[2 * i].store(nullptr, std::memory_order_relaxed);
-        epochFinished[2 * i + 1].store(nullptr, std::memory_order_relaxed);
+        epochFinished[i].store(nullptr, std::memory_order_relaxed);
     }
 
     maxFrames.resize(omp_max_threads, 0);
@@ -319,6 +318,16 @@ void DistributedKadabra::fillResult() {
 void DistributedKadabra::run() {
     init();
     fabry::communicator world{fabry::world};
+    fabry::communicator shmCom = world.split_shared(fabry::collective);
+    fabry::communicator netCom;
+    if(shmCom.is_rank_zero()) {
+        netCom = world.split_color(fabry::collective, 0);
+    }else{
+        netCom = world.split_color(fabry::collective);
+    }
+    if(world.is_rank_zero())
+        INFO("shmCom has ", shmCom.n_ranks(), " ranks, ",
+                "netCom has ", netCom.n_ranks(), " ranks");
     const count n = G.upperNodeIdBound();
     const auto omp_max_threads = omp_get_max_threads();
     const omp_index globalCount = omp_max_threads * world.n_ranks();
@@ -420,6 +429,8 @@ void DistributedKadabra::run() {
     if (!absolute)
         top->clear();
 
+    fabry::passive_rdma_array<count> window{fabry::collective, shmCom, G.upperNodeIdBound() + 1};
+
     DistributedStatus status(unionSample);
     phase2Timer.start();
 #pragma omp parallel
@@ -450,15 +461,18 @@ void DistributedKadabra::run() {
             sampler.rng.seed(seed1 ^ (epochToWrite * globalCount + globalT));
         };
 
-        auto recycleFrame = [&](int epochToPublish) {
+        auto recycleFrame = [&]() {
             auto finishedFrame =
-                epochFinished[2 * t + (epochToPublish & 1)].load(std::memory_order_relaxed);
+                epochFinished[t].load(std::memory_order_relaxed);
             if (finishedFrame) {
                 unused.push_back(finishedFrame);
             }
         };
 
-        auto maybeAdvance = [&]() {
+        auto doSample = [&]() {
+            sampler.randomPath(curFrame);
+            curFrame->nPairs++;
+
             if (deterministic) {
                 assert(curFrame->nPairs <= 1000);
                 if (curFrame->nPairs == 1000) {
@@ -472,31 +486,19 @@ void DistributedKadabra::run() {
                     auto epochToPublish = static_cast<int32_t>(frame->epoch);
                     assert(etr <= epochToPublish);
                     if (etr == epochToPublish) {
-                        recycleFrame(epochToPublish);
-                        epochFinished[2 * t + (epochToPublish & 1)].store(frame, std::memory_order_release);
+                        recycleFrame();
+                        epochFinished[t].store(frame, std::memory_order_release);
                         finishedQueue.pop_front();
                     }
                 }
             } else {
                 auto etr = epochToRead.load(std::memory_order_relaxed);
-                assert(etr <= epochToWrite);
                 if (etr == epochToWrite) {
-                    recycleFrame(epochToWrite);
-                    epochFinished[2 * t + (epochToWrite & 1)].store(curFrame, std::memory_order_release);
+                    recycleFrame();
+                    epochFinished[t].store(curFrame, std::memory_order_release);
                     moveToNextEpoch();
-                } else if(etr + 1 == epochToWrite && curFrame->nPairs >= 1000) {
-                    recycleFrame(epochToWrite);
-                    epochFinished[2 * t + (epochToWrite & 1)].store(curFrame, std::memory_order_release);
-                    moveToNextEpoch();
-                    fastAdvances.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-        };
-
-        auto doSample = [&]() {
-            sampler.randomPath(curFrame);
-            curFrame->nPairs++;
-            maybeAdvance();
         };
 
         curFrame->reset(epochToWrite);
@@ -509,6 +511,7 @@ void DistributedKadabra::run() {
             if (!t) {
                 Aux::Timer phase2SyncTimer;
                 Aux::Timer phase2TransitionTimer;
+                Aux::Timer phase2BarrierTimer;
                 Aux::Timer phase2ReduceTimer;
                 Aux::Timer phase2CheckTimer;
 
@@ -519,43 +522,56 @@ void DistributedKadabra::run() {
                 auto etr = epochRead + 1;
                 epochToRead.store(etr, std::memory_order_relaxed);
 
-                // Try to advance the epoch in thread zero so that a fast-path
-                // in aggregateLocally() is possible.
-                maybeAdvance();
-
                 // Perform local aggregation.
                 phase2TransitionTimer.start();
                 std::fill(aggregationDone.begin(), aggregationDone.end(), false);
                 {
-                    memset(localBuffer.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+                    fabry::passive_rdma_array_scope<count> as{window};
+                    memset(as.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
 
                     while(true) {
-                        if(aggregateLocally(localBuffer.data()))
+                        if(aggregateLocally(as.data()))
                             break;
                         doSample();
                     }
                 }
                 phase2TransitionTime += phase2TransitionTimer.elapsedMilliseconds();
 
-                // Perform RDMA aggregation.
-                phase2ReduceTimer.start();
-                if(world.is_rank_zero()) {
-                    fabry::pollable aggReduction{world.reduce(fabry::this_root,
-                            localBuffer.data(), localBuffer.size(), stagingBuffer.data())};
-                    while(!aggReduction.done())
-                        doSample();
+                phase2BarrierTimer.start();
+                fabry::pollable aggregationBarrier{shmCom.barrier(fabry::collective)};
+                while(!aggregationBarrier.done())
+                    doSample();
+                phase2BarrierTime += phase2BarrierTimer.elapsedMilliseconds();
 
-                    for (count i = 0; i < G.upperNodeIdBound(); ++i)
-                        approxSum[i] += stagingBuffer[i + 1];
-                    nPairs += stagingBuffer[0];
-                }else{
-                    fabry::pollable aggReduction{world.reduce(fabry::zero_root,
-                            localBuffer.data(), localBuffer.size())};
-                    while(!aggReduction.done())
-                        doSample();
+                phase2ReduceTimer.start();
+                if(shmCom.is_rank_zero()) {
+                    // Perform shmCom aggregation (from RDMA window to localBuffer).
+                    memset(localBuffer.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+                    for(int rk = 0; rk < shmCom.n_ranks(); rk++) {
+                        window.get_sync(rk, stagingBuffer.data());
+
+                        for (count i = 0; i < G.upperNodeIdBound() + 1; ++i)
+                            localBuffer[i] += stagingBuffer[i];
+                    }
+
+                    // Perform netCom aggregation (from localBuffer to stagingBuffer).
+                    if(netCom.is_rank_zero()) {
+                        fabry::pollable aggReduction{netCom.reduce(fabry::this_root,
+                                localBuffer.data(), localBuffer.size(), stagingBuffer.data())};
+                        while(!aggReduction.done())
+                            doSample();
+
+                        for (count i = 0; i < G.upperNodeIdBound(); ++i)
+                            approxSum[i] += stagingBuffer[i + 1];
+                        nPairs += stagingBuffer[0];
+                    }else{
+                        fabry::pollable aggReduction{netCom.reduce(fabry::zero_root,
+                                 localBuffer.data(), localBuffer.size())};
+                        while(!aggReduction.done())
+                            doSample();
+                    }
                 }
                 phase2ReduceTime += phase2ReduceTimer.elapsedMilliseconds();
-                phase2BarrierTime += phase2ReduceTimer.elapsedMilliseconds();
 
                 // Check the stopping condition on rank zero.
                 int globalStop;
@@ -585,6 +601,8 @@ void DistributedKadabra::run() {
     }
     phase2Time += phase2Timer.elapsedMilliseconds();
 
+    window.dispose(fabry::collective);
+
 #pragma omp parallel for
     for (omp_index i = 0; i < static_cast<omp_index>(n); ++i) {
         approxSum[i] /= (double)nPairs;
@@ -607,10 +625,10 @@ void DistributedKadabra::run() {
 bool DistributedKadabra::aggregateLocally(count *data) {
     bool allEpochsFinished = true;
     const count omp_max_threads = omp_get_max_threads();
-    const auto etr = epochToRead.load(std::memory_order_relaxed);
     for (count j = 0; j < omp_max_threads; ++j) {
-        auto frame = epochFinished[2 * j + (etr & 1)].load(std::memory_order_acquire);
-        if (!frame || static_cast<int32_t>(frame->epoch) != etr) {
+        auto frame = epochFinished[j].load(std::memory_order_acquire);
+        if (!frame || static_cast<int32_t>(frame->epoch)
+                != epochToRead.load(std::memory_order_relaxed)) {
             allEpochsFinished = false;
             continue;
         }

@@ -48,8 +48,6 @@ int main(int argc, char **argv) {
         std::cout << "num_nodes: " << g.upperNodeIdBound() << std::endl;
         std::cout << "num_edges: " << g.numberOfEdges() << std::endl;
         std::cout << "num_epochs: " << algo.numEpochs() << std::endl;
-        std::cout << "fast_advances: "
-                << algo.fastAdvances.load(std::memory_order_relaxed) << std::endl;
         std::cout << "num_samples: " << algo.getNumberOfIterations() << std::endl;
         std::cout << "time: " << secElapsed.count() << std::endl;
         std::cout << "mtime_diam: " << algo.diamTime << std::endl;
