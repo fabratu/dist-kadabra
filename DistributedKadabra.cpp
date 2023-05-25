@@ -521,20 +521,6 @@ void DistributedKadabra::run() {
                 }
                 phase2TransitionTime += phase2TransitionTimer.elapsedMilliseconds();
 
-                phase2BarrierTimer.start();
-                fabry::pollable aggBarrier{world.barrier(fabry::collective)};
-                while(true) {
-                    Aux::StartedTimer ioTimer;
-                    bool done = aggBarrier.done();
-                    phase2BarrierIoTime += ioTimer.elapsedMilliseconds();
-                    if(done)
-                        break;
-                    Aux::StartedTimer overlapTimer;
-                    doSample();
-                    phase2BarrierOverlapTime += overlapTimer.elapsedMilliseconds();
-                }
-                phase2BarrierTime += phase2BarrierTimer.elapsedMilliseconds();
-
                 // Perform RDMA aggregation.
                 phase2ReduceTimer.start();
                 if(world.is_rank_zero()) {
