@@ -187,7 +187,6 @@ class DistributedKadabra : public Algorithm {
     // For benchmarking only:
     int64_t diamTime = 0;
     int64_t phase1Time = 0;
-    int64_t calibrateTime = 0;
     int64_t phase2Time = 0;
     int64_t phase2SyncTime = 0;
     int64_t phase2TransitionTime = 0;
