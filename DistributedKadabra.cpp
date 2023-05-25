@@ -318,6 +318,16 @@ void DistributedKadabra::fillResult() {
 void DistributedKadabra::run() {
     init();
     fabry::communicator world{fabry::world};
+    fabry::communicator shmCom = world.split_shared(fabry::collective);
+    fabry::communicator netCom;
+    if(shmCom.is_rank_zero()) {
+        netCom = world.split_color(fabry::collective, 0);
+    }else{
+        netCom = world.split_color(fabry::collective);
+    }
+    if(world.is_rank_zero())
+        INFO("shmCom has ", shmCom.n_ranks(), " ranks, ",
+                "netCom has ", netCom.n_ranks(), " ranks");
     const count n = G.upperNodeIdBound();
     const auto omp_max_threads = omp_get_max_threads();
     const omp_index globalCount = omp_max_threads * world.n_ranks();
@@ -419,7 +429,7 @@ void DistributedKadabra::run() {
     if (!absolute)
         top->clear();
 
-    fabry::passive_rdma_array<count> window{fabry::collective, world, G.upperNodeIdBound() + 1};
+    fabry::passive_rdma_array<count> window{fabry::collective, shmCom, G.upperNodeIdBound() + 1};
 
     DistributedStatus status(unionSample);
     phase2Timer.start();
@@ -504,6 +514,7 @@ void DistributedKadabra::run() {
                 Aux::Timer phase2BarrierTimer;
                 Aux::Timer phase2ReduceTimer;
                 Aux::Timer phase2CheckTimer;
+                Aux::Timer phase2BcastTimer;
 
                 phase2SyncTimer.start();
                 // Thread zero also has to check the stopping condition.
@@ -528,25 +539,63 @@ void DistributedKadabra::run() {
                 phase2TransitionTime += phase2TransitionTimer.elapsedMilliseconds();
 
                 phase2BarrierTimer.start();
-                fabry::pollable aggregationBarrier{world.barrier(fabry::collective)};
-                while(!aggregationBarrier.done())
+                fabry::pollable aggShmBarrier{shmCom.barrier(fabry::collective)};
+                while(true) {
+                    Aux::StartedTimer ioTimer;
+                    bool done = aggShmBarrier.done();
+                    phase2BarrierIoTime += ioTimer.elapsedMilliseconds();
+                    if(done)
+                        break;
+                    Aux::StartedTimer overlapTimer;
                     doSample();
+                    phase2BarrierOverlapTime += overlapTimer.elapsedMilliseconds();
+                }
                 phase2BarrierTime += phase2BarrierTimer.elapsedMilliseconds();
 
-                // Perform RDMA aggregation.
-                phase2ReduceTimer.start();
-                if(world.is_rank_zero()) {
-                    for(int rk = 0; rk < world.n_ranks(); rk++) {
+                if(shmCom.is_rank_zero()) {
+                    // Perform shmCom aggregation (from RDMA window to localBuffer).
+                    phase2ReduceTimer.start();
+                    memset(localBuffer.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+                    for(int rk = 0; rk < shmCom.n_ranks(); rk++) {
                         window.get_sync(rk, stagingBuffer.data());
+
+                        for (count i = 0; i < G.upperNodeIdBound() + 1; ++i)
+                            localBuffer[i] += stagingBuffer[i];
+                    }
+                    phase2ReduceTime += phase2ReduceTimer.elapsedMilliseconds();
+
+                    phase2BarrierTimer.start();
+                    fabry::pollable aggNetBarrier{netCom.barrier(fabry::collective)};
+                    while(true) {
+                        Aux::StartedTimer ioTimer;
+                        bool done = aggNetBarrier.done();
+                        phase2BarrierIoTime += ioTimer.elapsedMilliseconds();
+                        if(done)
+                            break;
+                        Aux::StartedTimer overlapTimer;
+                        doSample();
+                        phase2BarrierOverlapTime += overlapTimer.elapsedMilliseconds();
+                    }
+                    phase2BarrierTime += phase2BarrierTimer.elapsedMilliseconds();
+
+                    // Perform netCom aggregation (from localBuffer to stagingBuffer).
+                    phase2ReduceTimer.start();
+                    if(netCom.is_rank_zero()) {
+                        fabry::post(netCom.reduce(fabry::this_root,
+                                localBuffer.data(), localBuffer.size(), stagingBuffer.data()));
 
                         for (count i = 0; i < G.upperNodeIdBound(); ++i)
                             approxSum[i] += stagingBuffer[i + 1];
                         nPairs += stagingBuffer[0];
+                    }else{
+                        fabry::post(netCom.reduce(fabry::zero_root,
+                                 localBuffer.data(), localBuffer.size()));
                     }
+                    phase2ReduceTime += phase2ReduceTimer.elapsedMilliseconds();
                 }
-                phase2ReduceTime += phase2ReduceTimer.elapsedMilliseconds();
 
                 // Check the stopping condition on rank zero.
+                phase2BcastTimer.start();
                 int globalStop;
                 if(world.is_rank_zero()) {
                     phase2CheckTimer.start();
@@ -560,6 +609,7 @@ void DistributedKadabra::run() {
                     while(!convergenceBcast.done())
                         doSample();
                 }
+                phase2BcastTime += phase2BcastTimer.elapsedMilliseconds();
                 if(globalStop)
                     stop.store(true, std::memory_order_relaxed);
 
