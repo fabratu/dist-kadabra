@@ -191,8 +191,13 @@ class DistributedKadabra : public Algorithm {
     int64_t phase2SyncTime = 0;
     int64_t phase2TransitionTime = 0;
     int64_t phase2BarrierTime = 0;
+    int64_t phase2BarrierIoTime = 0;
+    int64_t phase2BarrierOverlapTime = 0;
     int64_t phase2ReduceTime = 0;
+    int64_t phase2ReduceIoTime = 0;
+    int64_t phase2ReduceOverlapTime = 0;
     int64_t phase2CheckTime = 0;
+    int64_t phase2BcastTime = 0;
 
   protected:
     const Graph &G;
