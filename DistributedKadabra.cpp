@@ -191,12 +191,12 @@ void DistributedKadabra::computeBetErr(DistributedStatus *status, std::vector<do
 }
 
 void DistributedKadabra::computeDeltaGuess() {
+    fabry::communicator world{fabry::world};
     const count n = G.upperNodeIdBound();
     const double balancingFactor = 0.001;
     double a = 0,
            b = 1. / err / err * std::log(n * 4 * (1 - balancingFactor) / delta),
            c = (a + b) / 2;
-    double sum;
 
     DistributedStatus status(unionSample);
     getStatus(&status, true);
@@ -204,35 +204,46 @@ void DistributedKadabra::computeDeltaGuess() {
     std::vector<double> bet(status.k);
     std::vector<double> errL(status.k);
     std::vector<double> errU(status.k);
+    std::vector<double> errLTerm(status.k);
+    std::vector<double> errUTerm(status.k);
 
     computeBetErr(&status, bet, errL, errU);
 
-    for (count i = 0; i < unionSample; ++i) {
+    const count estChunk = (unionSample + world.n_ranks() - 1) / world.n_ranks();
+    const count estDisp = world.rank() * estChunk;
+    const count estLimit = std::min(unionSample, estDisp + estChunk);
+
+#pragma omp parallel for
+    for (count i = estDisp; i < estLimit; ++i) {
         count v = status.top[i];
         approxSum[v] = approxSum[v] / (double)nPairs;
+        errLTerm[i] = errL[i] * errL[i] / bet[i];
+        errUTerm[i] = errU[i] * errU[i] / bet[i];
     }
 
+    int binSearchIters = 0;
     while (b - a > err / 10.) {
         c = (b + a) / 2.;
-        sum = 0;
+        double localSum = 0;
 #pragma omp parallel for
-        for (omp_index i = 0; i < static_cast<omp_index>(unionSample); ++i) {
-            sum += std::exp(-c * errL[i] * errL[i] / bet[i]);
-            sum += std::exp(-c * errU[i] * errU[i] / bet[i]);
+        for (omp_index i = estDisp; i < static_cast<omp_index>(estLimit); ++i) {
+            localSum += std::exp(-c * errLTerm[i]);
+            localSum += std::exp(-c * errUTerm[i]);
         }
 
-        sum += std::exp(-c * errL[unionSample - 1] * errL[unionSample - 1] /
-                        bet[unionSample - 1]) *
-               (n - unionSample);
-        sum += std::exp(-c * errU[unionSample - 1] * errU[unionSample - 1] /
-                        bet[unionSample - 1]) *
-               (n - unionSample);
+        double globalSum;
+        fabry::post(world.all_reduce(&localSum, 1, &globalSum));
 
-        if (sum >= delta / 2. * (1 - balancingFactor))
+        globalSum += std::exp(-c * errLTerm[unionSample - 1]) * (n - unionSample);
+        globalSum += std::exp(-c * errUTerm[unionSample - 1]) * (n - unionSample);
+
+        if (globalSum >= delta / 2. * (1 - balancingFactor))
             a = c;
         else
             b = c;
+        binSearchIters++;
     }
+    INFO("iterations in binary search: ", binSearchIters);
 
     deltaLMinGuess = std::exp(-b * errL[unionSample - 1] *
                               errL[unionSample - 1] / bet[unionSample - 1]) +
@@ -324,6 +335,7 @@ void DistributedKadabra::run() {
 
     Aux::Timer diamTimer;
     Aux::Timer phase1Timer;
+    Aux::Timer phase1EstimateTimer;
     Aux::Timer phase2Timer;
 
     // Compute the number of samples per SF as in our EUROPAR'19 paper.
@@ -388,22 +400,18 @@ void DistributedKadabra::run() {
             localBuffer[i] += firstFrames[j].apx[i];
     }
 
-    if (world.is_rank_zero()) {
-        fabry::post(world.reduce(fabry::this_root,
-                localBuffer.data(), G.upperNodeIdBound(), stagingBuffer.data()));
+    fabry::post(world.all_reduce(localBuffer.data(), G.upperNodeIdBound(), stagingBuffer.data()));
 
-        for (count i = 0; i < G.upperNodeIdBound(); ++i)
-            approxSum[i] += stagingBuffer[i];
-    }else{
-        fabry::post(world.reduce(fabry::zero_root,
-                localBuffer.data(), G.upperNodeIdBound()));
-    }
+    for (count i = 0; i < G.upperNodeIdBound(); ++i)
+        approxSum[i] += stagingBuffer[i];
 
     nPairs = tau;
     if (!absolute) {
         fillPQ();
     }
+    phase1EstimateTimer.start();
     computeDeltaGuess();
+    phase1EstimateTime += phase1EstimateTimer.elapsedMilliseconds();
     phase1Time += phase1Timer.elapsedMilliseconds();
 
     epochToRead.store(0, std::memory_order_relaxed);
