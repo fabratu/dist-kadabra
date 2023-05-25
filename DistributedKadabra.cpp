@@ -388,14 +388,18 @@ void DistributedKadabra::run() {
     }
 
     if (world.is_rank_zero()) {
-        fabry::post(world.reduce(fabry::this_root,
-                localBuffer.data(), G.upperNodeIdBound(), stagingBuffer.data()));
+        fabry::pollable aggReduction{world.reduce(fabry::this_root,
+                localBuffer.data(), G.upperNodeIdBound(), stagingBuffer.data())};
+        while(!aggReduction.done())
+            ;
 
         for (count i = 0; i < G.upperNodeIdBound(); ++i)
             approxSum[i] += stagingBuffer[i];
     }else{
-        fabry::post(world.reduce(fabry::zero_root,
-                localBuffer.data(), G.upperNodeIdBound()));
+        fabry::pollable aggReduction{world.reduce(fabry::zero_root,
+                localBuffer.data(), G.upperNodeIdBound())};
+        while(!aggReduction.done())
+            ;
     }
 
     nPairs = tau;
@@ -414,6 +418,8 @@ void DistributedKadabra::run() {
 
     if (!absolute)
         top->clear();
+
+    fabry::passive_rdma_array<count> window{fabry::collective, world, G.upperNodeIdBound() + 1};
 
     DistributedStatus status(unionSample);
     phase2Timer.start();
@@ -498,7 +504,6 @@ void DistributedKadabra::run() {
                 Aux::Timer phase2BarrierTimer;
                 Aux::Timer phase2ReduceTimer;
                 Aux::Timer phase2CheckTimer;
-                Aux::Timer phase2BcastTimer;
 
                 phase2SyncTimer.start();
                 // Thread zero also has to check the stopping condition.
@@ -511,37 +516,37 @@ void DistributedKadabra::run() {
                 phase2TransitionTimer.start();
                 std::fill(aggregationDone.begin(), aggregationDone.end(), false);
                 {
-                    memset(localBuffer.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+                    fabry::passive_rdma_array_scope<count> as{window};
+                    memset(as.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
 
                     while(true) {
-                        if(aggregateLocally(localBuffer.data()))
+                        if(aggregateLocally(as.data()))
                             break;
                         doSample();
                     }
                 }
                 phase2TransitionTime += phase2TransitionTimer.elapsedMilliseconds();
 
+                phase2BarrierTimer.start();
+                fabry::pollable aggregationBarrier{world.barrier(fabry::collective)};
+                while(!aggregationBarrier.done())
+                    doSample();
+                phase2BarrierTime += phase2BarrierTimer.elapsedMilliseconds();
+
                 // Perform RDMA aggregation.
                 phase2ReduceTimer.start();
                 if(world.is_rank_zero()) {
-                    Aux::StartedTimer ioTimer;
-                    fabry::post(world.reduce(fabry::this_root,
-                            localBuffer.data(), localBuffer.size(), stagingBuffer.data()));
-                    phase2ReduceIoTime += ioTimer.elapsedMilliseconds();
+                    for(int rk = 0; rk < world.n_ranks(); rk++) {
+                        window.get_sync(rk, stagingBuffer.data());
 
-                    for (count i = 0; i < G.upperNodeIdBound(); ++i)
-                        approxSum[i] += stagingBuffer[i + 1];
-                    nPairs += stagingBuffer[0];
-                }else{
-                    Aux::StartedTimer ioTimer;
-                    fabry::post(world.reduce(fabry::zero_root,
-                            localBuffer.data(), localBuffer.size()));
-                    phase2ReduceIoTime += ioTimer.elapsedMilliseconds();
+                        for (count i = 0; i < G.upperNodeIdBound(); ++i)
+                            approxSum[i] += stagingBuffer[i + 1];
+                        nPairs += stagingBuffer[0];
+                    }
                 }
                 phase2ReduceTime += phase2ReduceTimer.elapsedMilliseconds();
 
                 // Check the stopping condition on rank zero.
-                phase2BcastTimer.start();
                 int globalStop;
                 if(world.is_rank_zero()) {
                     phase2CheckTimer.start();
@@ -555,7 +560,6 @@ void DistributedKadabra::run() {
                     while(!convergenceBcast.done())
                         doSample();
                 }
-                phase2BcastTime += phase2BcastTimer.elapsedMilliseconds();
                 if(globalStop)
                     stop.store(true, std::memory_order_relaxed);
 
@@ -569,6 +573,8 @@ void DistributedKadabra::run() {
 #pragma omp barrier
     }
     phase2Time += phase2Timer.elapsedMilliseconds();
+
+    window.dispose(fabry::collective);
 
 #pragma omp parallel for
     for (omp_index i = 0; i < static_cast<omp_index>(n); ++i) {
