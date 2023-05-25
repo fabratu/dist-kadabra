@@ -268,11 +268,9 @@ void DistributedKadabra::init() {
     approxSum.resize(n, 0);
     deltaLGuess.resize(n, 0);
     deltaUGuess.resize(n, 0);
-    if (!G.isDirected()) {
-        this->cc =
-            std::unique_ptr<ConnectedComponents>(new ConnectedComponents(G));
-        this->cc->run();
-    }
+    cc = std::unique_ptr<ConnectedComponents>(new ConnectedComponents(G));
+    if (determineComponents && !G.isDirected())
+        cc->run();
     epochFinished = std::vector<std::atomic<DistributedStateFrame *>>(omp_max_threads);
     samplerVec.reserve(omp_max_threads);
     for (count i = 0; i < omp_max_threads; ++i) {
@@ -318,6 +316,7 @@ void DistributedKadabra::fillResult() {
 
 void DistributedKadabra::run() {
     init();
+    fabry::communicator world{fabry::world};
     const count n = G.upperNodeIdBound();
     const auto omp_max_threads = omp_get_max_threads();
 
@@ -358,17 +357,45 @@ void DistributedKadabra::run() {
 
     std::vector<DistributedStateFrame> firstFrames(omp_max_threads, DistributedStateFrame(n));
 
+    const int tau_disp = world.rank();
+    const int tau_step = world.n_ranks();
 #pragma omp parallel for schedule(dynamic)
-    for (omp_index i = 0; i < static_cast<omp_index>(tau); ++i) {
+    for (omp_index i = tau_disp; i < static_cast<omp_index>(tau); i += tau_step) {
         auto t = omp_get_thread_num();
         samplerVec[t].rng.seed(seed0 ^ i);
         samplerVec[t].randomPath(&firstFrames[t]);
     }
 
+    std::vector<count> localBuffer;
+    localBuffer.resize(G.upperNodeIdBound() + 1);
+
+    std::vector<count> stagingBuffer;
+    stagingBuffer.resize(G.upperNodeIdBound() + 1);
+
+#pragma omp parallel for
+    for (omp_index i = 0; i < static_cast<omp_index>(G.upperNodeIdBound()); ++i) {
+        for (int j = 0; j < omp_max_threads; ++j)
+            localBuffer[i] += firstFrames[j].apx[i];
+    }
+
+    if (world.is_rank_zero()) {
+        fabry::pollable aggReduction{world.reduce(fabry::this_root,
+                localBuffer.data(), G.upperNodeIdBound(), stagingBuffer.data())};
+        while(!aggReduction.done())
+            ;
+
+        for (count i = 0; i < G.upperNodeIdBound(); ++i)
+            approxSum[i] += stagingBuffer[i];
+    }else{
+        fabry::pollable aggReduction{world.reduce(fabry::zero_root,
+                localBuffer.data(), G.upperNodeIdBound())};
+        while(!aggReduction.done())
+            ;
+    }
+
     nPairs = tau;
 
     epochToRead.store(0, std::memory_order_relaxed);
-    computeApproxParallel(firstFrames);
     if (!absolute) {
         fillPQ();
     }
@@ -382,12 +409,7 @@ void DistributedKadabra::run() {
     if (!absolute)
         top->clear();
 
-    fabry::communicator world{fabry::world};
-    std::vector<count> window;
-    window.resize(G.upperNodeIdBound() + 1);
-
-    std::vector<count> stagingBuffer;
-    stagingBuffer.resize(G.upperNodeIdBound() + 1);
+    fabry::passive_rdma_array<count> window{fabry::collective, world, G.upperNodeIdBound() + 1};
 
     DistributedStatus status(unionSample);
 #pragma omp parallel
@@ -470,21 +492,17 @@ void DistributedKadabra::run() {
                 // Thread zero also has to check the stopping condition.
                 assert(epochToRead.load(std::memory_order_relaxed) == epochRead);
 
-                //INFO(world.rank(), " enters the barrier");
-                fabry::pollable epochBarrier{world.barrier(fabry::collective)};
-                while(!epochBarrier.done())
-                    doSample();
-
                 auto etr = epochRead + 1;
                 epochToRead.store(etr, std::memory_order_relaxed);
 
                 // Perform local aggregation.
                 std::fill(aggregationDone.begin(), aggregationDone.end(), false);
                 {
-                    memset(window.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
+                    fabry::passive_rdma_array_scope<count> as{window};
+                    memset(as.data(), 0, sizeof(count) * (G.upperNodeIdBound() + 1));
 
                     while(true) {
-                        if(aggregateLocally(window.data()))
+                        if(aggregateLocally(as.data()))
                             break;
                         doSample();
                     }
@@ -496,19 +514,13 @@ void DistributedKadabra::run() {
 
                 // Perform RDMA aggregation.
                 if(world.is_rank_zero()) {
-                    fabry::pollable aggReduction{world.reduce(fabry::this_root,
-                            window.data(), window.size(), stagingBuffer.data())};
-                    while(!aggReduction.done())
-                        doSample();
+                    for(int rk = 0; rk < world.n_ranks(); rk++) {
+                        window.get_sync(rk, stagingBuffer.data());
 
-                    for (count i = 0; i < G.upperNodeIdBound(); ++i)
-                        approxSum[i] += stagingBuffer[i + 1];
-                    nPairs += stagingBuffer[0];
-                }else{
-                    fabry::pollable aggReduction{world.reduce(fabry::zero_root,
-                            window.data(), window.size())};
-                    while(!aggReduction.done())
-                        doSample();
+                        for (count i = 0; i < G.upperNodeIdBound(); ++i)
+                            approxSum[i] += stagingBuffer[i + 1];
+                        nPairs += stagingBuffer[0];
+                    }
                 }
 
                 // Check the stopping condition on rank zero.
@@ -534,6 +546,8 @@ void DistributedKadabra::run() {
         // allocated frames
 #pragma omp barrier
     }
+
+    window.dispose(fabry::collective);
 
 #pragma omp parallel for
     for (omp_index i = 0; i < static_cast<omp_index>(n); ++i) {
@@ -607,7 +621,8 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
     while (u == v)
         v = distr(rng);
 
-    if (!G.isDirected() && cc.componentOfNode(u) != cc.componentOfNode(v))
+    if (DistributedKadabra::determineComponents
+            && !G.isDirected() && cc.componentOfNode(u) != cc.componentOfNode(v))
         return;
 
     count endQ = 2;

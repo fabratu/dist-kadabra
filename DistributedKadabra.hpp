@@ -78,6 +78,8 @@ class DistributedSpSampler {
  */
 class DistributedKadabra : public Algorithm {
   public:
+    static const bool determineComponents = false;
+
     // See EUROPAR'19 paper for the selection of these parameters.
     unsigned int baseItersPerStep = 1000;
     double itersPerStepExp = 1.33;
