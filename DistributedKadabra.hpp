@@ -78,8 +78,6 @@ class DistributedSpSampler {
  */
 class DistributedKadabra : public Algorithm {
   public:
-    static const bool determineComponents = false;
-
     // See EUROPAR'19 paper for the selection of these parameters.
     unsigned int baseItersPerStep = 1000;
     double itersPerStepExp = 1.33;
@@ -183,16 +181,6 @@ class DistributedKadabra : public Algorithm {
     count numEpochs() const {
         return epochRead;
     }
-
-    // For benchmarking only:
-    int64_t diamTime = 0;
-    int64_t phase1Time = 0;
-    int64_t phase2Time = 0;
-    int64_t phase2SyncTime = 0;
-    int64_t phase2TransitionTime = 0;
-    int64_t phase2BarrierTime = 0;
-    int64_t phase2ReduceTime = 0;
-    int64_t phase2CheckTime = 0;
 
   protected:
     const Graph &G;
