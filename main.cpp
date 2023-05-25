@@ -56,13 +56,8 @@ int main(int argc, char **argv) {
         std::cout << "mtime_sync: " << algo.phase2SyncTime << std::endl;
         std::cout << "mtime_transition: " << algo.phase2TransitionTime << std::endl;
         std::cout << "mtime_barrier: " << algo.phase2BarrierTime << std::endl;
-        std::cout << "io_mtime_barrier: " << algo.phase2BarrierIoTime << std::endl;
-        std::cout << "overlap_mtime_barrier: " << algo.phase2BarrierOverlapTime << std::endl;
         std::cout << "mtime_reduce: " << algo.phase2ReduceTime << std::endl;
-        std::cout << "io_mtime_reduce: " << algo.phase2ReduceIoTime << std::endl;
-        std::cout << "overlap_mtime_reduce: " << algo.phase2ReduceOverlapTime << std::endl;
         std::cout << "mtime_check: " << algo.phase2CheckTime << std::endl;
-        std::cout << "mtime_bcast: " << algo.phase2BcastTime << std::endl;
 
         auto ranking = algo.ranking();
         std::cout << "ranking:" << std::endl;

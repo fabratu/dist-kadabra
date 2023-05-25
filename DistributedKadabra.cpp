@@ -499,10 +499,8 @@ void DistributedKadabra::run() {
             if (!t) {
                 Aux::Timer phase2SyncTimer;
                 Aux::Timer phase2TransitionTimer;
-                Aux::Timer phase2BarrierTimer;
                 Aux::Timer phase2ReduceTimer;
                 Aux::Timer phase2CheckTimer;
-                Aux::Timer phase2BcastTimer;
 
                 phase2SyncTimer.start();
                 // Thread zero also has to check the stopping condition.
@@ -525,35 +523,13 @@ void DistributedKadabra::run() {
                 }
                 phase2TransitionTime += phase2TransitionTimer.elapsedMilliseconds();
 
-                phase2BarrierTimer.start();
-                fabry::pollable aggBarrier{world.barrier(fabry::collective)};
-                while(true) {
-                    Aux::StartedTimer ioTimer;
-                    bool done = aggBarrier.done();
-                    phase2BarrierIoTime += ioTimer.elapsedMilliseconds();
-                    if(done)
-                        break;
-                    Aux::StartedTimer overlapTimer;
-                    doSample();
-                    phase2BarrierOverlapTime += overlapTimer.elapsedMilliseconds();
-                }
-                phase2BarrierTime += phase2BarrierTimer.elapsedMilliseconds();
-
                 // Perform RDMA aggregation.
                 phase2ReduceTimer.start();
                 if(world.is_rank_zero()) {
                     fabry::pollable aggReduction{world.reduce(fabry::this_root,
                             localBuffer.data(), localBuffer.size(), stagingBuffer.data())};
-                    while(true) {
-                        Aux::StartedTimer ioTimer;
-                        bool done = aggReduction.done();
-                        phase2ReduceIoTime += ioTimer.elapsedMilliseconds();
-                        if(done)
-                            break;
-                        Aux::StartedTimer overlapTimer;
+                    while(!aggReduction.done())
                         doSample();
-                        phase2ReduceOverlapTime += overlapTimer.elapsedMilliseconds();
-                    }
 
                     for (count i = 0; i < G.upperNodeIdBound(); ++i)
                         approxSum[i] += stagingBuffer[i + 1];
@@ -561,21 +537,13 @@ void DistributedKadabra::run() {
                 }else{
                     fabry::pollable aggReduction{world.reduce(fabry::zero_root,
                             localBuffer.data(), localBuffer.size())};
-                    while(true) {
-                        Aux::StartedTimer ioTimer;
-                        bool done = aggReduction.done();
-                        phase2ReduceIoTime += ioTimer.elapsedMilliseconds();
-                        if(done)
-                            break;
-                        Aux::StartedTimer overlapTimer;
+                    while(!aggReduction.done())
                         doSample();
-                        phase2ReduceOverlapTime += overlapTimer.elapsedMilliseconds();
-                    }
                 }
                 phase2ReduceTime += phase2ReduceTimer.elapsedMilliseconds();
+                phase2BarrierTime += phase2ReduceTimer.elapsedMilliseconds();
 
                 // Check the stopping condition on rank zero.
-                phase2BcastTimer.start();
                 int globalStop;
                 if(world.is_rank_zero()) {
                     phase2CheckTimer.start();
@@ -589,7 +557,6 @@ void DistributedKadabra::run() {
                     while(!convergenceBcast.done())
                         doSample();
                 }
-                phase2BcastTime += phase2BcastTimer.elapsedMilliseconds();
                 if(globalStop)
                     stop.store(true, std::memory_order_relaxed);
 
