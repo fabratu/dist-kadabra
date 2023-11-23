@@ -204,35 +204,40 @@ void DistributedKadabra::computeDeltaGuess() {
     std::vector<double> bet(status.k);
     std::vector<double> errL(status.k);
     std::vector<double> errU(status.k);
+    std::vector<double> errLTerm(status.k);
+    std::vector<double> errUTerm(status.k);
 
     computeBetErr(&status, bet, errL, errU);
 
+#pragma omp parallel for
     for (count i = 0; i < unionSample; ++i) {
         count v = status.top[i];
         approxSum[v] = approxSum[v] / (double)nPairs;
+        errLTerm[i] = errL[i] * errL[i] / bet[i];
+        errUTerm[i] = errU[i] * errU[i] / bet[i];
     }
+
+    int binSearchIters = 0;
 
     while (b - a > err / 10.) {
         c = (b + a) / 2.;
         sum = 0;
 #pragma omp parallel for
         for (omp_index i = 0; i < static_cast<omp_index>(unionSample); ++i) {
-            sum += std::exp(-c * errL[i] * errL[i] / bet[i]);
-            sum += std::exp(-c * errU[i] * errU[i] / bet[i]);
+            sum += std::exp(-c * errLTerm[i]);
+            sum += std::exp(-c * errUTerm[i]);
         }
 
-        sum += std::exp(-c * errL[unionSample - 1] * errL[unionSample - 1] /
-                        bet[unionSample - 1]) *
-               (n - unionSample);
-        sum += std::exp(-c * errU[unionSample - 1] * errU[unionSample - 1] /
-                        bet[unionSample - 1]) *
-               (n - unionSample);
+        sum += std::exp(-c * errLTerm[unionSample - 1]) * (n - unionSample);
+        sum += std::exp(-c * errUTerm[unionSample - 1]) * (n - unionSample);
 
         if (sum >= delta / 2. * (1 - balancingFactor))
             a = c;
         else
             b = c;
+        binSearchIters++;
     }
+    INFO("iterations in binary search: ", binSearchIters);
 
     deltaLMinGuess = std::exp(-b * errL[unionSample - 1] *
                               errL[unionSample - 1] / bet[unionSample - 1]) +
