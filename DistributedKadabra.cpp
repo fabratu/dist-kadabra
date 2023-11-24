@@ -11,6 +11,7 @@
 #include <deque>
 #include <limits>
 #include <omp.h>
+#include <unordered_map>
 
 #include <fabry/fabry.hpp>
 #include <networkit/auxiliary/Parallel.hpp>
@@ -239,19 +240,17 @@ void DistributedKadabra::computeDeltaGuess() {
     }
     INFO("iterations in binary search: ", binSearchIters);
 
-    deltaLMinGuess = std::exp(-b * errL[unionSample - 1] *
-                              errL[unionSample - 1] / bet[unionSample - 1]) +
+    deltaLMinGuess = std::exp(-b * errLTerm[unionSample - 1]) +
                      delta * balancingFactor / 4. / (double)n;
-    deltaUMinGuess = std::exp(-b * errU[unionSample - 1] *
-                              errU[unionSample - 1] / bet[unionSample - 1]) +
+    deltaUMinGuess = std::exp(-b * errUTerm[unionSample - 1]) +
                      delta * balancingFactor / 4. / (double)n;
 
 #pragma omp parallel for
     for (omp_index i = 0; i < static_cast<omp_index>(unionSample); ++i) {
         node v = status.top[i];
-        deltaLGuess[v] = std::exp(-b * errL[i] * errL[i] / bet[i]) +
+        deltaLGuess[v] = std::exp(-b * errLTerm[i]) +
                          delta * balancingFactor / 4. / (double)n;
-        deltaUGuess[v] = std::exp(-b * errU[i] * errU[i] / bet[i]) +
+        deltaUGuess[v] = std::exp(-b * errUTerm[i]) +
                          delta * balancingFactor / 4. / (double)n;
     }
 }
@@ -599,7 +598,6 @@ void DistributedKadabra::run() {
                 phase2SyncTime += phase2SyncTimer.elapsedMilliseconds();
             }
         }
-
         // Guarantees that all threads finish the loop here and destroy
         // allocated frames
 #pragma omp barrier
@@ -623,6 +621,7 @@ void DistributedKadabra::run() {
     }
     fillResult();
     nPairs += tau;
+
 
     hasRun = true;
 }
@@ -673,7 +672,7 @@ DistributedSpSampler::DistributedSpSampler(const Graph &G, const ConnectedCompon
     nPaths.resize(n);
 }
 
-void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
+void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {    
     frame = curFrame;
     node u = distr(rng);
     node v = distr(rng);
@@ -707,10 +706,11 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
     count sumDegsU = 0, sumDegsV = 0, *sumDegsCur;
     count totWeight = 0, curEdge = 0;
 
-    auto procNeighbor = [&](const node x, const node y) {
+    auto procNeighbor = [&](const node x, const node y, const count degY) {
         // Node not visited
         if ((timestamp[y] & stampMask) != globalTS) {
-            (*sumDegsCur) += getDegree(G, y, useDegreeIn);
+            (*sumDegsCur) += degY;
+            //(*sumDegsCur) += getDegree(G, y, useDegreeIn);
             nPaths[y] = nPaths[x];
             timestamp[y] = globalTS + (timestamp[x] & ballMask);
             q[endQ++] = y;
@@ -733,7 +733,7 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
             endU = endQ;
             sumDegsU = 0;
             sumDegsCur = &sumDegsU;
-            useDegreeIn = false;
+            // useDegreeIn = false;
         } else {
             startCur = startV;
             endCur = endV;
@@ -742,17 +742,35 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
             endV = endQ;
             sumDegsV = 0;
             sumDegsCur = &sumDegsV;
-            useDegreeIn = true;
+            // useDegreeIn = true;
         }
 
         while (startCur < endCur) {
             x = q[startCur++];
+            auto degX = G.degree(x);
+            std::vector<std::pair<node,count>> neighborInfo(degX);
+            // std::unordered_map<count, count> neighborDegrees;
+            for(int i = 0; i < degX; ++i) {
+                auto ithNeighbor = G.getIthNeighbor(x, i);
+                neighborInfo[i] = std::make_pair(ithNeighbor, G.degree(ithNeighbor));
+            }
+            // G.forNeighborsOf(x, [&](const node y) {
+                neighborDegrees[y] = G.degree(y);
+            // });
+            
+            for(int i = 0; i < degX; ++i) {
+                procNeighbor(x, neighborInfo[i].first, neighborInfo[i].second);
+            }
 
-            if (useDegreeIn)
-                G.forInNeighborsOf(x,
-                                   [&](const node y) { procNeighbor(x, y); });
-            else
-                G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y); });
+            // G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y, neighborDegrees[y]); });
+
+            // G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y, neighborDegrees); });
+
+            // if (useDegreeIn)
+            //     G.forInNeighborsOf(x,
+            //                        [&](const node y) { procNeighbor(x, y); });
+            // else
+            //     G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y); });
         }
 
         if (*sumDegsCur == 0)
