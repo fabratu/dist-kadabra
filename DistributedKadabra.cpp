@@ -706,10 +706,10 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
     count sumDegsU = 0, sumDegsV = 0, *sumDegsCur;
     count totWeight = 0, curEdge = 0;
 
-    auto procNeighbor = [&](const node x, const node y, const count degY) {
+    auto procNeighbor = [&](const node x, const node y) {
         // Node not visited
         if ((timestamp[y] & stampMask) != globalTS) {
-            (*sumDegsCur) += degY;
+            (*sumDegsCur) += G.degree(y);
             //(*sumDegsCur) += getDegree(G, y, useDegreeIn);
             nPaths[y] = nPaths[x];
             timestamp[y] = globalTS + (timestamp[x] & ballMask);
@@ -747,22 +747,8 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
 
         while (startCur < endCur) {
             x = q[startCur++];
-            auto degX = G.degree(x);
-            std::vector<std::pair<node,count>> neighborInfo(degX);
-            // std::unordered_map<count, count> neighborDegrees;
-            for(int i = 0; i < degX; ++i) {
-                auto ithNeighbor = G.getIthNeighbor(x, i);
-                neighborInfo[i] = std::make_pair(ithNeighbor, G.degree(ithNeighbor));
-            }
-            // G.forNeighborsOf(x, [&](const node y) {
-                neighborDegrees[y] = G.degree(y);
-            // });
-            
-            for(int i = 0; i < degX; ++i) {
-                procNeighbor(x, neighborInfo[i].first, neighborInfo[i].second);
-            }
 
-            // G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y, neighborDegrees[y]); });
+            G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y); });
 
             // G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y, neighborDegrees); });
 
