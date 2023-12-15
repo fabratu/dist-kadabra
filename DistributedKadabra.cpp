@@ -204,62 +204,53 @@ void DistributedKadabra::computeDeltaGuess() {
     std::vector<double> bet(status.k);
     std::vector<double> errL(status.k);
     std::vector<double> errU(status.k);
+    std::vector<double> errLTerm(status.k);
+    std::vector<double> errUTerm(status.k);
 
     computeBetErr(&status, bet, errL, errU);
 
+#pragma omp parallel for
     for (count i = 0; i < unionSample; ++i) {
         count v = status.top[i];
         approxSum[v] = approxSum[v] / (double)nPairs;
+        errLTerm[i] = errL[i] * errL[i] / bet[i];
+        errUTerm[i] = errU[i] * errU[i] / bet[i];
     }
+
+    int binSearchIters = 0;
 
     while (b - a > err / 10.) {
         c = (b + a) / 2.;
         sum = 0;
 #pragma omp parallel for
         for (omp_index i = 0; i < static_cast<omp_index>(unionSample); ++i) {
-            sum += std::exp(-c * errL[i] * errL[i] / bet[i]);
-            sum += std::exp(-c * errU[i] * errU[i] / bet[i]);
+            sum += std::exp(-c * errLTerm[i]);
+            sum += std::exp(-c * errUTerm[i]);
         }
 
-        sum += std::exp(-c * errL[unionSample - 1] * errL[unionSample - 1] /
-                        bet[unionSample - 1]) *
-               (n - unionSample);
-        sum += std::exp(-c * errU[unionSample - 1] * errU[unionSample - 1] /
-                        bet[unionSample - 1]) *
-               (n - unionSample);
+        sum += std::exp(-c * errLTerm[unionSample - 1]) * (n - unionSample);
+        sum += std::exp(-c * errUTerm[unionSample - 1]) * (n - unionSample);
 
         if (sum >= delta / 2. * (1 - balancingFactor))
             a = c;
         else
             b = c;
+        binSearchIters++;
     }
+    INFO("iterations in binary search: ", binSearchIters);
 
-    deltaLMinGuess = std::exp(-b * errL[unionSample - 1] *
-                              errL[unionSample - 1] / bet[unionSample - 1]) +
+    deltaLMinGuess = std::exp(-b * errLTerm[unionSample - 1]) +
                      delta * balancingFactor / 4. / (double)n;
-    deltaUMinGuess = std::exp(-b * errU[unionSample - 1] *
-                              errU[unionSample - 1] / bet[unionSample - 1]) +
+    deltaUMinGuess = std::exp(-b * errUTerm[unionSample - 1]) +
                      delta * balancingFactor / 4. / (double)n;
 
 #pragma omp parallel for
     for (omp_index i = 0; i < static_cast<omp_index>(unionSample); ++i) {
         node v = status.top[i];
-        deltaLGuess[v] = std::exp(-b * errL[i] * errL[i] / bet[i]) +
+        deltaLGuess[v] = std::exp(-b * errLTerm[i]) +
                          delta * balancingFactor / 4. / (double)n;
-        deltaUGuess[v] = std::exp(-b * errU[i] * errU[i] / bet[i]) +
+        deltaUGuess[v] = std::exp(-b * errUTerm[i]) +
                          delta * balancingFactor / 4. / (double)n;
-    }
-}
-
-void DistributedKadabra::computeApproxParallel(
-    const std::vector<DistributedStateFrame> &firstFrames) {
-    const count omp_max_threads = omp_get_max_threads();
-#pragma omp parallel for
-    for (omp_index i = 0; i < static_cast<omp_index>(G.upperNodeIdBound());
-         ++i) {
-        for (count j = 0; j < omp_max_threads; ++j) {
-            approxSum[i] += firstFrames[j].apx[i];
-        }
     }
 }
 
@@ -335,7 +326,7 @@ void DistributedKadabra::run() {
     // but may be inefficient for large graphs. What is the maximum relative
     // error that we can tolerate?
     diamTimer.start();
-    Diameter diam(G, estimatedRange, 0.f);
+    Diameter diam(G, estimatedRange, 0.5);
     diam.run();
     // Getting diameter upper bound
     int32_t diameter = diam.getDiameter().second;
@@ -690,7 +681,8 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
     auto procNeighbor = [&](const node x, const node y) {
         // Node not visited
         if ((timestamp[y] & stampMask) != globalTS) {
-            (*sumDegsCur) += getDegree(G, y, useDegreeIn);
+            // (*sumDegsCur) += getDegree(G, y, useDegreeIn);
+            (*sumDegsCur) += G.degree(y);
             nPaths[y] = nPaths[x];
             timestamp[y] = globalTS + (timestamp[x] & ballMask);
             q[endQ++] = y;
@@ -713,7 +705,7 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
             endU = endQ;
             sumDegsU = 0;
             sumDegsCur = &sumDegsU;
-            useDegreeIn = false;
+            // useDegreeIn = false;
         } else {
             startCur = startV;
             endCur = endV;
@@ -722,17 +714,12 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
             endV = endQ;
             sumDegsV = 0;
             sumDegsCur = &sumDegsV;
-            useDegreeIn = true;
+            // useDegreeIn = true;
         }
 
         while (startCur < endCur) {
             x = q[startCur++];
-
-            if (useDegreeIn)
-                G.forInNeighborsOf(x,
-                                   [&](const node y) { procNeighbor(x, y); });
-            else
-                G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y); });
+            G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y); });
         }
 
         if (*sumDegsCur == 0)
