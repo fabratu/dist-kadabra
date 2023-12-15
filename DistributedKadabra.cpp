@@ -348,7 +348,7 @@ void DistributedKadabra::run() {
     // but may be inefficient for large graphs. What is the maximum relative
     // error that we can tolerate?
     diamTimer.start();
-    Diameter diam(G, estimatedRange, 0.f);
+    Diameter diam(G, estimatedRange, 0.5);
     diam.run();
     // Getting diameter upper bound
     int32_t diameter = diam.getDiameter().second;
