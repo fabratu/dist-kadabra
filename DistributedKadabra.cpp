@@ -695,7 +695,8 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
     auto procNeighbor = [&](const node x, const node y) {
         // Node not visited
         if ((timestamp[y] & stampMask) != globalTS) {
-            (*sumDegsCur) += getDegree(G, y, useDegreeIn);
+            (*sumDegsCur) += G.degree(y);
+            // (*sumDegsCur) += getDegree(G, y, useDegreeIn);
             nPaths[y] = nPaths[x];
             timestamp[y] = globalTS + (timestamp[x] & ballMask);
             q[endQ++] = y;
@@ -718,7 +719,7 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
             endU = endQ;
             sumDegsU = 0;
             sumDegsCur = &sumDegsU;
-            useDegreeIn = false;
+            // useDegreeIn = false;
         } else {
             startCur = startV;
             endCur = endV;
@@ -727,17 +728,12 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
             endV = endQ;
             sumDegsV = 0;
             sumDegsCur = &sumDegsV;
-            useDegreeIn = true;
+            // useDegreeIn = true;
         }
 
         while (startCur < endCur) {
             x = q[startCur++];
-
-            if (useDegreeIn)
-                G.forInNeighborsOf(x,
-                                   [&](const node y) { procNeighbor(x, y); });
-            else
-                G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y); });
+            G.forNeighborsOf(x, [&](const node y) { procNeighbor(x, y); });
         }
 
         if (*sumDegsCur == 0)
