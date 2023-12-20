@@ -13,11 +13,3 @@ target_include_directories(dist-kadabra PUBLIC "${PROJECT_SOURCE_DIR}/." ${NETWO
 target_link_libraries(dist-kadabra PUBLIC OpenMP::OpenMP_CXX PkgConfig::NETWORKIT PkgConfig::FABRY)
 set_target_properties(dist-kadabra PROPERTIES INSTALL_RPATH "\\\$ORIGIN/lib")
 install(TARGETS dist-kadabra DESTINATION ${CMAKE_INSTALL_PREFIX})
-
-find_library(CLAMPI_LIBRARY
-    NAMES clampi libclampi
-    HINTS "${CLAMPI_PREFIX}/lib"
-    REQUIRED
-)
-
-target_link_libraries(dist-kadabra PUBLIC ${CLAMPI_LIBRARY})
