@@ -28,11 +28,13 @@ DistributedStatus::DistributedStatus(const count k)
 
 DistributedKadabra::DistributedKadabra(const Graph &G, const double err,
                                        const double delta,
-                                       const bool deterministic, const count k,
+                                       const bool deterministic, 
+                                       const double diameterHeuristic,
+                                       const count k,
                                        count unionSample,
                                        const count startFactor)
-    : G(G), delta(delta), err(err), deterministic(deterministic), k(k),
-      startFactor(startFactor), unionSample(unionSample), absolute(k == 0),
+    : G(G), delta(delta), err(err), deterministic(deterministic), diameterHeuristic(diameterHeuristic), 
+      k(k), startFactor(startFactor), unionSample(unionSample), absolute(k == 0),
       stop(false) {
     const count n = G.upperNodeIdBound();
     if (k > n)
@@ -47,6 +49,10 @@ DistributedKadabra::DistributedKadabra(const Graph &G, const double err,
     if (err >= 1 || err <= 0)
         throw std::runtime_error(
             "The error should be greater than 0 and smaller than 1.");
+
+    if (diameterHeuristic > 1  || diameterHeuristic < 0)
+        throw std::runtime_error(
+            "The error for diameter should be at least 0 and not greater than 1");
 
     seed0 = Aux::Random::integer();
     seed1 = Aux::Random::integer();
@@ -338,7 +344,7 @@ void DistributedKadabra::run() {
     // but may be inefficient for large graphs. What is the maximum relative
     // error that we can tolerate?
     diamTimer.start();
-    Diameter diam(G, estimatedRange, 0.5);
+    Diameter diam(G, estimatedRange, diameterHeuristic);
     diam.run();
     // Getting diameter upper bound
     int32_t diameter = diam.getDiameter().second;
