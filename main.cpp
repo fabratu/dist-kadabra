@@ -34,7 +34,12 @@ int main(int argc, char **argv) {
     if(g.isWeighted())
         throw std::runtime_error("Graph needs to be unweighted");
 
-    NetworKit::DistributedKadabra algo{g, epsilon, 0.1, deterministic};
+    double diamError = 0.5;
+
+    if (argc == 3) {
+		diamError = std::stod(std::string(argv[2]));
+    }
+    NetworKit::DistributedKadabra algo{g, epsilon, 0.1, deterministic, diamError};
 
     // Do a barrier so that the algorithm can be timed correctly.
     fabry::post(world.barrier(fabry::collective));

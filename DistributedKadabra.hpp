@@ -115,7 +115,9 @@ class DistributedKadabra : public Algorithm {
      */
     DistributedKadabra(const Graph &G, const double err = 0.01,
                        const double delta = 0.1,
-                       const bool deterministic = false, const count k = 0,
+                       const bool deterministic = false, 
+                       const double diameterHeuristic = 0.5,
+                       const count k = 0,
                        count unionSample = 0, const count startFactor = 100);
 
     /**
@@ -205,6 +207,7 @@ class DistributedKadabra : public Algorithm {
     const double delta, err;
     const bool deterministic;
     const count k, startFactor;
+    const double diameterHeuristic;
     count unionSample;
     count nPairs;
     const bool absolute;
