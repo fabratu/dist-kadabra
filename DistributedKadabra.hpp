@@ -186,6 +186,10 @@ class DistributedKadabra : public Algorithm {
         return epochRead;
     }
 
+    count diamError() const {
+        return diameterHeuristic;
+    }
+
     // For benchmarking only:
     int64_t diamTime = 0;
     int64_t phase1Time = 0;
