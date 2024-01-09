@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
         std::cout << "num_edges: " << g.numberOfEdges() << std::endl;
         std::cout << "num_epochs: " << algo.numEpochs() << std::endl;
         std::cout << "num_samples: " << algo.getNumberOfIterations() << std::endl;
+        std::cout << "diam_error: " << algo.diamError() << std::endl;
         std::cout << "time: " << secElapsed.count() << std::endl;
         std::cout << "mtime_diam: " << algo.diamTime << std::endl;
         std::cout << "mtime_phase1: " << algo.phase1Time << std::endl;
