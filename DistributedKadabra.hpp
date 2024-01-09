@@ -186,7 +186,7 @@ class DistributedKadabra : public Algorithm {
         return epochRead;
     }
 
-    count diamError() const {
+    double diamError() const {
         return diameterHeuristic;
     }
 
