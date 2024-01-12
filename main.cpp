@@ -61,6 +61,8 @@ int main(int argc, char **argv) {
         std::cout << "num_samples: " << algo.getNumberOfIterations() << std::endl;
         std::cout << "diam_error: " << algo.diamError() << std::endl;
         std::cout << "diameter: " << algo.diamApprox().first << "," << algo.diamApprox().second << std::endl;
+        std::cout << "Omega: " << algo.getOmega() << std::endl;
+        std::cout << "Exited early: " << algo.hasExitedEarly() << std::endl;
         std::cout << "time: " << secElapsed.count() << std::endl;
         std::cout << "mtime_diam: " << algo.diamTime << std::endl;
         std::cout << "mtime_phase1: " << algo.phase1Time << std::endl;

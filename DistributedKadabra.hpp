@@ -194,6 +194,10 @@ class DistributedKadabra : public Algorithm {
         return diameterApproximation;
     }
 
+    bool hasExitedEarly() {
+        return exitedEarly;
+    }
+
     // For benchmarking only:
     int64_t diamTime = 0;
     int64_t phase1Time = 0;
@@ -221,6 +225,7 @@ class DistributedKadabra : public Algorithm {
     count nPairs;
     const bool absolute;
     double deltaLMinGuess, deltaUMinGuess, omega;
+    bool exitedEarly;
     std::atomic<int32_t> epochToRead;
     int32_t epochRead;
     std::vector<bool> aggregationDone;

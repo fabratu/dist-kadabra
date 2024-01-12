@@ -649,6 +649,10 @@ bool DistributedKadabra::checkConvergence(DistributedStatus &status) {
 */
 
     getStatus(&status);
+    bool res = nPairs >= omega || computeFinished(&status);
+    
+    res && nPairs < omega ? exitedEarly = true : exitedEarly = false;
+
     return nPairs >= omega || computeFinished(&status);
 }
 
