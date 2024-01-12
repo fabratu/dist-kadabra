@@ -2,12 +2,16 @@
 #include <chrono>
 
 #include <fabry/fabry.hpp>
+#include <networkit/auxiliary/Log.hpp>
 #include <networkit/auxiliary/Random.hpp>
 #include <networkit/io/NetworkitBinaryReader.hpp>
 
 #include "DistributedKadabra.hpp"
 
 int main(int argc, char **argv) {
+
+    Aux::Log::setLogLevel("INFO");
+
     fabry::program p{&argc, &argv};
     fabry::communicator world{fabry::world};
 
@@ -41,6 +45,7 @@ int main(int argc, char **argv) {
     }
     NetworKit::DistributedKadabra algo{g, epsilon, 0.1, deterministic, diamError};
 
+
     // Do a barrier so that the algorithm can be timed correctly.
     fabry::post(world.barrier(fabry::collective));
 
@@ -55,6 +60,7 @@ int main(int argc, char **argv) {
         std::cout << "num_epochs: " << algo.numEpochs() << std::endl;
         std::cout << "num_samples: " << algo.getNumberOfIterations() << std::endl;
         std::cout << "diam_error: " << algo.diamError() << std::endl;
+        std::cout << "diameter: " << algo.diamApprox().first << "," << algo.diamApprox().second << std::endl;
         std::cout << "time: " << secElapsed.count() << std::endl;
         std::cout << "mtime_diam: " << algo.diamTime << std::endl;
         std::cout << "mtime_phase1: " << algo.phase1Time << std::endl;

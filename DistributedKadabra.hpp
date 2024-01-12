@@ -190,6 +190,10 @@ class DistributedKadabra : public Algorithm {
         return diameterHeuristic;
     }
 
+    std::pair<int32_t, int32_t> diamApprox() {
+        return diameterApproximation;
+    }
+
     // For benchmarking only:
     int64_t diamTime = 0;
     int64_t phase1Time = 0;
@@ -212,6 +216,7 @@ class DistributedKadabra : public Algorithm {
     const bool deterministic;
     const count k, startFactor;
     const double diameterHeuristic;
+    std::pair<int32_t, int32_t> diameterApproximation;
     count unionSample;
     count nPairs;
     const bool absolute;

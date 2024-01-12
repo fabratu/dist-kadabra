@@ -354,6 +354,8 @@ void DistributedKadabra::run() {
     // Getting diameter upper bound
     int32_t diameter = diam.getDiameter().second;
     INFO("diameter estimate is [", diam.getDiameter().first, ", ", diameter, ")");
+    diameterApproximation.first = diam.getDiameter().first;
+    diameterApproximation.second = diam.getDiameter().second;
     omega =
         0.5 / err / err * (std::log2(diameter - 1) + 1 + std::log(0.5 / delta));
     diamTime += diamTimer.elapsedMilliseconds();
