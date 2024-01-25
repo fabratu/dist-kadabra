@@ -119,7 +119,7 @@ double DistributedKadabra::computeG(const double btilde, const count iterNum,
         (std::log(1. / deltaU)) * 1. / iterNum *
         (tmp +
          std::sqrt(tmp * tmp + 2 * btilde * omega / (std::log(1. / deltaU))));
-    return std::min(errChern, 1 - btilde);
+    return std::max(errChern, 1 - btilde);
 }
 
 void DistributedKadabra::getStatus(DistributedStatus *status, const bool parallel) const {
@@ -670,8 +670,11 @@ void DistributedSpSampler::randomPath(DistributedStateFrame *curFrame) {
     frame = curFrame;
     node u = distr(rng);
     node v = distr(rng);
-    while (u == v)
-        v = distr(rng);
+
+    while (u == v || G.hasEdge(u, v)) {
+        v = u;
+        u = distr(rng);
+    }
 
     if (DistributedKadabra::determineComponents
             && !G.isDirected() && cc.componentOfNode(u) != cc.componentOfNode(v))
